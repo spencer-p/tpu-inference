@@ -167,10 +167,18 @@ class Fp8TensorwiseLinearMethod(QuantizeMethodBase,
 class Fp8BlockwiseLinearMethod(QuantizeMethodBase, common_fp8.Fp8LinearMethod):
     """Block-wise Fp8 method for JAX Linear layer."""
 
-    def __init__(self, quant_config: "Fp8Config", layer: JaxEinsum,
-                 linear_config: QuantLinearConfig):
+    def __init__(self,
+                 quant_config: "Fp8Config",
+                 layer: JaxEinsum,
+                 linear_config: QuantLinearConfig,
+                 weight_scale_name: str = "weight_scale_inv"):
         common_fp8.Fp8LinearMethod.__init__(self, linear_config)
         self.quant_config = quant_config
+        # Checkpoint-dependent name of the dequant scale: DeepSeek-style fp8
+        # checkpoints serialize "weight_scale_inv" while compressed-tensors
+        # uses "weight_scale". Both are the same quantity (the multiplier in
+        # x ~= q * scale); only the serialized name differs.
+        self.weight_scale_name = weight_scale_name
         self.einsum_str = layer.einsum_str
 
         self.out_features = linear_config.out_features
@@ -209,15 +217,17 @@ class Fp8BlockwiseLinearMethod(QuantizeMethodBase, common_fp8.Fp8LinearMethod):
             layer.weight.set_metadata('sharding', self.weight_sharding)
 
             # Per-output-channel scale (1D, covers the free weight dim).
-            layer.weight_scale_inv = nnx.Param(
-                jnp.ones((out_features, ), dtype=layer.dtype),
-                weight_loader=partial(
-                    load_nnx_param_from_reshaped_torch,
-                    permute_dims=None,
-                    param_name=layer.prefix + ".weight_scale_inv",
-                ),
-                eager_sharding=False)
-            layer.weight_scale_inv.set_metadata('sharding', ())
+            scale_param = nnx.Param(jnp.ones((out_features, ),
+                                             dtype=layer.dtype),
+                                    weight_loader=partial(
+                                        load_nnx_param_from_reshaped_torch,
+                                        permute_dims=None,
+                                        param_name=layer.prefix + "." +
+                                        self.weight_scale_name,
+                                    ),
+                                    eager_sharding=False)
+            scale_param.set_metadata('sharding', ())
+            setattr(layer, self.weight_scale_name, scale_param)
             return
 
         # Follow upstream limitation that only float8_e4m3 is supported.
@@ -234,25 +244,26 @@ class Fp8BlockwiseLinearMethod(QuantizeMethodBase, common_fp8.Fp8LinearMethod):
         # Block-wise quantization scale
         block_n, block_k = self.quant_config.weight_block_size[
             0], self.quant_config.weight_block_size[1]
-        layer.weight_scale_inv = nnx.Param(
-            kernel_init(
-                rngs.params(),
-                [(self.in_features + block_k - 1) // block_k,
-                 (out_features + block_n - 1) // block_n],
-                layer.dtype,
-            ),
-            weight_loader=partial(
-                load_nnx_param_from_reshaped_torch,
-                permute_dims=(1, 0),
-                param_name=layer.prefix + ".weight_scale_inv",
-            ),
-            eager_sharding=False)
-        layer.weight_scale_inv.set_metadata('sharding', self.weight_sharding)
+        scale_param = nnx.Param(kernel_init(
+            rngs.params(),
+            [(self.in_features + block_k - 1) // block_k,
+             (out_features + block_n - 1) // block_n],
+            layer.dtype,
+        ),
+                                weight_loader=partial(
+                                    load_nnx_param_from_reshaped_torch,
+                                    permute_dims=(1, 0),
+                                    param_name=layer.prefix + "." +
+                                    self.weight_scale_name,
+                                ),
+                                eager_sharding=False)
+        scale_param.set_metadata('sharding', self.weight_sharding)
+        setattr(layer, self.weight_scale_name, scale_param)
 
         # Force the parameters to be loaded onto CPU, such that in `process_weights_after_loading`
         # we can process the weights on CPU to avoid OOM on device.
         layer.weight.set_metadata('mesh', cpu_mesh())
-        layer.weight_scale_inv.set_metadata('mesh', cpu_mesh())
+        scale_param.set_metadata('mesh', cpu_mesh())
         if layer.bias is not None:
             layer.bias.set_metadata('mesh', cpu_mesh())
 
@@ -265,9 +276,9 @@ class Fp8BlockwiseLinearMethod(QuantizeMethodBase, common_fp8.Fp8LinearMethod):
             # needed — the batched matmul uses dot_general with FP8 natively.
             return True
 
+        scale_param = getattr(layer, self.weight_scale_name)
         if not layer.weight.get_metadata(
-                "_is_loaded",
-                False) or not layer.weight_scale_inv.get_metadata(
+                "_is_loaded", False) or not scale_param.get_metadata(
                     "_is_loaded", False):
             # Weight and scale could spread across multiple files,
             # so we only process once both of them are loaded.
@@ -276,7 +287,7 @@ class Fp8BlockwiseLinearMethod(QuantizeMethodBase, common_fp8.Fp8LinearMethod):
         # Do the re-quant process on CPU to avoid OOM on device.
         with cpu_mesh_context():
             weight = layer.weight[...]
-            weight_scale_inv = layer.weight_scale_inv[...]
+            weight_scale_inv = scale_param[...]
             bias = layer.bias[...] if getattr(layer, 'bias',
                                               None) is not None else None
             if bias is not None:
@@ -294,7 +305,7 @@ class Fp8BlockwiseLinearMethod(QuantizeMethodBase, common_fp8.Fp8LinearMethod):
                 enable_kernel=self.linear_config.enable_quantized_matmul_kernel
             )
             delattr(layer, 'weight')
-            delattr(layer, 'weight_scale_inv')
+            delattr(layer, self.weight_scale_name)
             delattr(layer, 'bias')
 
         # Put onto the device.
@@ -306,7 +317,8 @@ class Fp8BlockwiseLinearMethod(QuantizeMethodBase, common_fp8.Fp8LinearMethod):
         )
         if self.linear_config.fuse_matmuls:
             layer.weight = nnx.Param(weights.weight)
-            layer.weight_scale_inv = nnx.Param(weights.weight_scale)
+            setattr(layer, self.weight_scale_name,
+                    nnx.Param(weights.weight_scale))
             layer.bias = nnx.Param(weights.bias) if bias is not None else None
         else:
             raise NotImplementedError(
@@ -320,7 +332,7 @@ class Fp8BlockwiseLinearMethod(QuantizeMethodBase, common_fp8.Fp8LinearMethod):
             out = sharded_quantized_batched_matmul(
                 x,
                 layer.weight[...],
-                layer.weight_scale_inv[...],
+                getattr(layer, self.weight_scale_name)[...],
                 einsum_str=self.einsum_str,
                 weight_sharding=self.weight_sharding,
                 mesh=self.linear_config.mesh)
@@ -329,7 +341,8 @@ class Fp8BlockwiseLinearMethod(QuantizeMethodBase, common_fp8.Fp8LinearMethod):
         if not self.linear_config.fuse_matmuls:
             raise NotImplementedError(
                 "Fp8 block-wise linear method only supports fuse_matmuls.")
-        weight, scale = layer.weight[...], layer.weight_scale_inv[...]
+        weight = layer.weight[...]
+        scale = getattr(layer, self.weight_scale_name)[...]
         bias = layer.bias[...] if layer.bias is not None else None
         # The fused matmul only accepts 2D input, so >2D callers (e.g.
         # embed_vision's [B, L, D] features, or o_proj's [T, N, H] which

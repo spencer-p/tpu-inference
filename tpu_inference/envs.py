@@ -74,7 +74,8 @@ if TYPE_CHECKING:
     LORA_MODULE_PATH: str = ""
     SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES: str = "auto"
     SLICE_ROPE_CACHE: bool = False
-
+    MIN_TOKEN_BUCKET: int = 16
+    MOE_ROUTE_PADDING_TO_EXPERT0: bool = False
 
 def env_with_choices(
     env_name: str,
@@ -122,7 +123,6 @@ def env_with_choices(
 
     return _get_validated_env
 
-
 def env_bool(env_name: str,
              default: bool | None = False,
              requires: list[str] | None = None) -> Callable[[], bool | None]:
@@ -163,7 +163,6 @@ def env_bool(env_name: str,
 
     return _get_bool_env
 
-
 def env_str_list(env_name: str) -> Callable[[], list[str]]:
     """
     Accepts a comma-separated string and returns a list of strings.
@@ -182,7 +181,6 @@ def env_str_list(env_name: str) -> Callable[[], list[str]]:
 
     return _get_str_list_env
 
-
 def env_int_list(env_name: str) -> Callable[[], list[int]]:
     """
     Accepts a comma-separated string and returns a list of strings.
@@ -200,7 +198,6 @@ def env_int_list(env_name: str) -> Callable[[], list[int]]:
         return [int(v.strip()) for v in value.split(",")]
 
     return _get_int_list_env
-
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # JAX platform selection (e.g., "tpu", "cpu", "proxy", "proxy,cpu")
@@ -424,8 +421,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_bool("SLICE_ROPE_CACHE", default=False),
     "MLA_TRANSPOSE_KV_CACHE":
     env_bool("MLA_TRANSPOSE_KV_CACHE", default=False),
+    # Minimum max num of batched tokens.
+    "MIN_TOKEN_BUCKET":
+    lambda: int(os.getenv("MIN_TOKEN_BUCKET") or "16"),
+    # Route padding tokens to expert 0 instead of picking other experts, to
+    # avoid activating unneeded experts and speed up the GMM kernel by not
+    # loading unnecessary weights. Only applies when DP attention size is 1
+    # (pure TP attention, e.g. TP8_EP), since under DP attention the padding
+    # is interleaved per rank and a single valid-token count cannot describe it.
+    "MOE_ROUTE_PADDING_TO_EXPERT0":
+    env_bool("MOE_ROUTE_PADDING_TO_EXPERT0", default=False),
 }
-
 
 def __getattr__(name: str) -> Any:
     """
@@ -437,7 +443,6 @@ def __getattr__(name: str) -> Any:
     if name in environment_variables:
         return environment_variables[name]()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
 
 def enable_envs_cache() -> None:
     """
@@ -456,7 +461,6 @@ def enable_envs_cache() -> None:
     # Cache all environment variables
     for key in environment_variables:
         __getattr__(key)
-
 
 def __dir__() -> list[str]:
     return list(environment_variables.keys())

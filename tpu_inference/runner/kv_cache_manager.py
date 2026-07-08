@@ -442,7 +442,12 @@ class KVCacheManager:
     def get_kv_cache_spec(self):
         # TODO(xiang): this hack tricks engine core to init successfully
         block_size = self.runner.cache_config.block_size
-        block_size *= self.runner.vllm_config.parallel_config.decode_context_parallel_size
+        # The KV cache context is sharded on KV_CONTEXT = (pcp, dcp), so a
+        # logical block holds `cp` tokens strided across the cp ranks (each rank
+        # gets `block_size`). Only one of pcp/dcp is >1 at a time.
+        parallel_config = self.runner.vllm_config.parallel_config
+        block_size *= parallel_config.decode_context_parallel_size
+        block_size *= parallel_config.prefill_context_parallel_size
         kv_cache_spec: dict[str, KVCacheSpec] = {}
 
         tp_axis_name = ShardingAxisName.ATTN_HEAD
@@ -807,7 +812,9 @@ class KVCacheManager:
                 assert kv_cache_tensor.size % page_size_bytes == 0
                 num_blocks = kv_cache_tensor.size // page_size_bytes
 
-            # Default KV cache is sharded over (BATCH=(dp, attn_dp))
+            # Default KV cache is sharded over (BATCH=(dp, attn_dp)) on the
+            # num_blocks dim, and over (KV_CONTEXT=(dcp, pcp)) in the 
+            # block_size dim.
             divisor = common_utils.get_mesh_shape_product(
                 self.runner.mesh, ShardingAxisName.BATCH)
 

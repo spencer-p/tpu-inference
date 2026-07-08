@@ -24,6 +24,8 @@ import tpu_inference.envs as envs
 from tpu_inference.kernels.collectives import \
     hierarchical_reduce_scatter as hier_rs
 from tpu_inference.kernels.megablox.gmm_v2 import gmm_v2
+from tpu_inference.kernels.sparse_core.dense_gather_reduce import \
+    dense_gather_reduce
 from tpu_inference.kernels.sparse_core.ragged_gather import \
     ragged_gather as ragged_gather_v1
 from tpu_inference.kernels.sparse_core.ragged_gather_reduce import \
@@ -195,7 +197,8 @@ def moe_gmm_local(x: jax.Array,
                   enable_rs_kernel: bool = False,
                   onehot_moe_permute_threshold: int = 0,
                   scatter_results: bool = False,
-                  moe_chunk_size: int = 0) -> jax.Array:
+                  moe_chunk_size: int = 0,
+                  defer_all_reduce: bool = False) -> jax.Array:
     """Main MoE logic on a local shard can run in TP or EP mode.
 
     Set parallelism for "tp" or "ep"
@@ -314,13 +317,12 @@ def moe_gmm_local(x: jax.Array,
                                                     cur_weights.reshape(-1),
                                                     cur_mask.reshape(-1), topk)
         else:
-            token_hidden_full = gmm2_res[cur_indices]
-            cur_sorted = token_hidden_full.reshape(
-                (-1, topk, gmm2_res.shape[-1]))
-            cur_topk_weights = jnp.expand_dims(cur_weights, axis=-1)
-            cur_weighted = cur_sorted * cur_topk_weights
-            cur_masked = jnp.where(cur_mask, cur_weighted, 0.0)
-            chunk_hidden = cur_masked.sum(axis=-2)
+            chunk_hidden = dense_gather_reduce(
+                gmm2_res,
+                topk_argsort_revert_indices,
+                topk_weights,
+                topk,
+            )
 
         if enable_rs_kernel:
             # Fallback to psum-scatter for small token sizes to avoid Mosaic compilation.
@@ -356,9 +358,11 @@ def moe_gmm_local(x: jax.Array,
             else:
                 out = chunk_hidden.astype(x.dtype)
         else:
-            out = jax.lax.psum(chunk_hidden,
-                               axis_name=reduction_axis).astype(x.dtype)
-
+            if not defer_all_reduce:
+                out = jax.lax.psum(chunk_hidden,
+                                   axis_name=reduction_axis).astype(x.dtype)
+            else:
+                out = chunk_hidden.astype(x.dtype)
         out_list.append(out)
 
     return jnp.concatenate(out_list,
@@ -384,6 +388,7 @@ def tensor_parallel_gmm(
     onehot_moe_permute_threshold: int = 0,
     scatter_results: bool = False,
     moe_chunk_size: int = 0,
+    defer_all_reduce: bool = False,
 ) -> jax.Array:
     data_p_spec = P(ShardingAxisName.MLP_DATA)
     attn_data_p_spec = P(ShardingAxisName.ATTN_DATA)
@@ -417,6 +422,7 @@ def tensor_parallel_gmm(
             onehot_moe_permute_threshold=onehot_moe_permute_threshold,
             scatter_results=scatter_results,
             moe_chunk_size=moe_chunk_size,
+            defer_all_reduce=defer_all_reduce,
         ),
         mesh=mesh,
         in_specs=(
@@ -468,6 +474,7 @@ def expert_parallel_gmm(
     onehot_moe_permute_threshold: int = 0,
     moe_chunk_size: int = 0,
     scatter_results: bool = False,
+    defer_all_reduce: bool = False,
 ) -> jax.Array:
     ep_size = get_mesh_shape_product(mesh, ShardingAxisName.EXPERT)
     ep_p_spec = P(ShardingAxisName.EXPERT)
@@ -500,6 +507,7 @@ def expert_parallel_gmm(
             enable_rs_kernel=enable_rs_kernel,
             scatter_results=scatter_results,
             moe_chunk_size=moe_chunk_size,
+            defer_all_reduce=defer_all_reduce,
         ),
         mesh=mesh,
         in_specs=(
@@ -567,6 +575,7 @@ def _apply_all_gather_fp8(hidden_states: jax.Array, mesh: Mesh,
     "onehot_moe_permute_threshold",
     "scatter_results",
     "moe_chunk_size",
+    "defer_all_reduce",
 ))
 def fused_moe_func(
     hidden_states: jax.Array,
@@ -587,6 +596,7 @@ def fused_moe_func(
     enable_rs_kernel: bool = False,
     onehot_moe_permute_threshold: int = 0,
     scatter_results: bool = False,
+    defer_all_reduce: bool = False,
     hash_based_topk_indices: jax.Array | None = None,
     expert_score_correction_bias: jax.Array | None = None,
     moe_chunk_size: int = 0,
@@ -756,6 +766,7 @@ def fused_moe_func(
             onehot_moe_permute_threshold=onehot_moe_permute_threshold,
             scatter_results=scatter_results,
             moe_chunk_size=moe_chunk_size,
+            defer_all_reduce=defer_all_reduce,
         )
     else:
         x = tensor_parallel_gmm(
@@ -776,6 +787,7 @@ def fused_moe_func(
             onehot_moe_permute_threshold=onehot_moe_permute_threshold,
             scatter_results=scatter_results,
             moe_chunk_size=moe_chunk_size,
+            defer_all_reduce=defer_all_reduce,
         )
 
     return x[:num_tokens, :hidden_size]

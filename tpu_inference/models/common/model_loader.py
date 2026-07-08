@@ -41,6 +41,8 @@ from tpu_inference.models.jax.utils.qwix.qwix_utils import (
     update_vllm_config_for_qwix_quantization)
 from tpu_inference.models.jax.utils.weight_utils import (BaseWeightLoader,
                                                          LoadableWithIterator)
+from tpu_inference.runner.mm_encoder_jit_manager import \
+    maybe_create_mm_encoder_jit_manager
 from tpu_inference.utils import to_jax_dtype, to_torch_dtype
 
 logger = init_logger(__name__)
@@ -72,6 +74,7 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
 
     from tpu_inference.models.jax.deepseek_v3 import DeepseekV3ForCausalLM
     from tpu_inference.models.jax.dflash import DFlashForCausalLM
+    from tpu_inference.models.jax.gemma4 import Gemma4ForCausalLM
     from tpu_inference.models.jax.gemma4_mm import \
         Gemma4ForConditionalGeneration
     from tpu_inference.models.jax.gemma4_mtp import Gemma4MTPForCausalLM
@@ -98,6 +101,7 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     _MODEL_REGISTRY["Qwen2ForCausalLM"] = Qwen2ForCausalLM
     _MODEL_REGISTRY[
         "Gemma4ForConditionalGeneration"] = Gemma4ForConditionalGeneration
+    _MODEL_REGISTRY["Gemma4ForCausalLM"] = Gemma4ForCausalLM
     _MODEL_REGISTRY["Gemma4MTPModel"] = Gemma4MTPForCausalLM
     _MODEL_REGISTRY["DFlashForCausalLM"] = DFlashForCausalLM
     _MODEL_REGISTRY["DFlashDraftModel"] = DFlashForCausalLM
@@ -465,8 +469,28 @@ def get_flax_model(
         return jitted_model_fn(*args, **kwargs)
 
     compute_logits_fn = run_compute_logits
-    embed_multimodal_fn = run_embed_multimodal
     embed_input_ids_fn = run_embed_input_ids
+
+    _mm_jit = maybe_create_mm_encoder_jit_manager(
+        vllm_config=vllm_config,
+        vllm_model=model,
+        vllm_runner=None,
+        params_and_buffers=None,
+    )
+    if _mm_jit is not None:
+        precompile_vision_encoder_fn = _mm_jit.precompile_vision_encoder
+
+        def embed_multimodal_fn(state_leaves, modality=None, **kwargs):
+            if modality is not None and _mm_jit.supports_modality(modality):
+                return _mm_jit.execute(kwargs)
+            return run_embed_multimodal(state_leaves,
+                                        modality=modality,
+                                        **kwargs)
+    else:
+        # TODO(kwang3939): implement SupportsEncoderCudaGraph for Qwen2.5-VL and enforce
+        # all JAX multimodal models to go through MMEncoderJITManager.
+        embed_multimodal_fn = run_embed_multimodal
+
     lora_manager, model = None, None
     combine_hidden_states_fn = combine_hidden_states
 
